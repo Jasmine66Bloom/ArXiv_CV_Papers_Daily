@@ -11,7 +11,7 @@ from config import (
     DECIDE_TEMPERATURE, DECIDE_MAX_TOKENS, DECIDE_TOP_P,
 )
 
-class ChatGLMHelper:
+class LLMHelper:
     """LLM助手类（支持豆包和ChatGLM双模型）"""
     
     def __init__(self):
@@ -19,7 +19,7 @@ class ChatGLMHelper:
         self.provider = LLM_PROVIDER.lower()
         
         if self.provider == "doubao":
-            from doubao_client import DoubaoClient
+            from llm_clients.doubao_client import DoubaoClient
             from config import DOUBAO_API_KEY, DOUBAO_MODEL, DOUBAO_BASE_URL
             if not DOUBAO_API_KEY:
                 raise ValueError("请在 .env 中设置DOUBAO_API_KEY")
@@ -27,7 +27,7 @@ class ChatGLMHelper:
             self.model = DOUBAO_MODEL
             print(f"🤖 使用豆包大模型: {self.model}")
         elif self.provider == "chatglm":
-            from chatglm_client import ChatGLMClient
+            from llm_clients.chatglm_client import ChatGLMClient
             from config import CHATGLM_API_KEY, CHATGLM_MODEL, CHATGLM_BASE_URL, CHATGLM_ENABLE_THINKING
             if not CHATGLM_API_KEY:
                 raise ValueError("请在 .env 中设置CHATGLM_API_KEY")
@@ -54,7 +54,7 @@ class ChatGLMHelper:
 
     def translate_title(self, title: str, abstract: str = "") -> str:
         """
-        使用ChatGLM翻译论文标题，增强的提示词和错误处理
+        使用LLM翻译论文标题，增强的提示词和错误处理
         Args:
             title: 论文英文标题
             abstract: 论文摘要，用于提供上下文（可选）
@@ -155,7 +155,7 @@ class ChatGLMHelper:
             }
 
     def decide_category(self, title: str, abstract: str, candidate_categories: List[Tuple], match_details: Dict = None) -> str:
-        """使用ChatGLM从候选类别中决定最终分类
+        """使用LLM从候选类别中决定最终分类
         
         Args:
             title: 论文标题
@@ -236,6 +236,6 @@ class ChatGLMHelper:
             return candidate_categories[0][0]
             
         except Exception as e:
-            print(f"ChatGLM 分类决策出错: {str(e)}")
+            print(f"LLM 分类决策出错: {str(e)}")
             # 发生错误时，返回得分最高的候选类别
             return candidate_categories[0][0] if candidate_categories else "其他 (Others)"

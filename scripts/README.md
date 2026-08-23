@@ -16,19 +16,23 @@ An automated system for fetching, analyzing, and organizing the latest computer 
 
 ```
 ArXiv_CV_Papers_Daily/
-├── scripts/                 # 脚本目录
-│   ├── get_cv_papers.py     # 主程序：抓取、分类、生成 Markdown
-│   ├── chatglm_helper.py    # LLM 助手：翻译、贡献分析、分类仲裁
-│   ├── chatglm_client.py    # ChatGLM 客户端封装
-│   ├── doubao_client.py     # 豆包客户端封装
-│   ├── categories_config.py # 分类体系与关键词配置
-│   ├── config.py            # 非敏感配置（可提交 Git）
-│   ├── .env.example         # 密钥模板（复制为 .env）
-│   └── requirements.txt     # 依赖
-├── data/                    # 表格格式论文信息
+├── scripts/                  # 脚本目录
+│   ├── main.py               # 主入口：抓取、并行分析、生成报告
+│   ├── llm_helper.py         # LLM 助手：翻译、贡献分析、分类仲裁
+│   ├── llm_clients/          # LLM 客户端封装
+│   │   ├── chatglm_client.py # ChatGLM 客户端
+│   │   └── doubao_client.py  # 豆包客户端
+│   ├── classifier.py         # 关键词分类与子类别判定
+│   ├── text_utils.py         # NLTK 初始化与文本预处理
+│   ├── markdown_output.py    # Markdown 生成与保存
+│   ├── categories_config.py  # 分类体系与关键词配置
+│   ├── config.py             # 非敏感配置（可提交 Git）
+│   ├── .env.example          # 密钥模板（复制为 .env）
+│   └── requirements.txt      # 依赖
+├── data/                     # 表格格式论文信息
 │   └── YYYY-MM/
 │       └── YYYY-MM-DD.md
-└── local/                   # 详细格式论文信息（本地，不提交 Git）
+└── local/                    # 详细格式论文信息（本地，不提交 Git）
     └── YYYY-MM/
         └── YYYY-MM-DD.md
 ```
@@ -76,7 +80,7 @@ CHATGLM_API_KEY=your_chatglm_api_key_here
 
 Run the main script:
 ```bash
-python get_cv_papers.py
+python main.py
 ```
 
 ### Output Files
@@ -121,7 +125,7 @@ Set up daily automatic runs using crontab:
 crontab -e
 
 # Add this line to run at 9 AM daily
-0 9 * * * cd /path/to/ArXiv_CV_Papers_Daily/scripts && python get_cv_papers.py
+0 9 * * * cd /path/to/ArXiv_CV_Papers_Daily/scripts && python main.py
 ```
 
 ## Error Handling
