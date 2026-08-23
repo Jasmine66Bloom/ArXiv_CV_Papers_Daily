@@ -4,23 +4,30 @@ import re
 import math
 import traceback
 from datetime import datetime, timedelta
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from typing import Dict, List, Tuple, Optional
+
+import arxiv
 from tqdm import tqdm
 
-from collections import defaultdict
 from categories_config import CATEGORY_DISPLAY_ORDER, CATEGORY_THRESHOLDS
 from chatglm_helper import ChatGLMHelper
-from typing import Dict, List, Tuple, Optional
-import traceback
-import arxiv
+
+# 查询参数集中维护在 config.py，这里统一导入
+from config import (
+    ARXIV_QUERY, ARXIV_PAGE_SIZE, ARXIV_DELAY_SECONDS,
+    ARXIV_NUM_RETRIES, ARXIV_BATCH_SIZE,
+    QUERY_DAYS_AGO, MAX_RESULTS, MAX_WORKERS,
+    LLM_MAX_WORKERS, MAX_AUTHORS_SHOWN,
+    ENABLE_TITLE_TRANSLATION, ENABLE_CONTRIBUTION_ANALYSIS,
+    ENABLE_LLM_ARBITRATION, ENABLE_DETAILED_OUTPUT,
+    DATA_DIR, LOCAL_DIR,
+)
 
 # 兼容 arxiv 1.4.8 的 HTTP 重定向行为，强制使用 HTTPS 查询端点
 ARXIV_API_URL_FORMAT = "https://export.arxiv.org/api/query?{}"
-
-# 查询参数设置
-QUERY_DAYS_AGO = 1           # 查询几天前的论文，0=今天，1=昨天，2=前天
-MAX_RESULTS = 300           # 最大返回论文数量
-MAX_WORKERS = 4            # 并行处理的最大线程数
 
 # 导入NLTK库用于文本预处理
 try:
@@ -28,6 +35,7 @@ try:
     from nltk.stem import PorterStemmer, WordNetLemmatizer
     from nltk.tokenize import word_tokenize
     from nltk.corpus import stopwords
+    from nltk.util import ngrams as _nltk_ngrams
     
     # 设置NLTK数据目录为项目scripts目录下的nltk_data
     nltk_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nltk_data')
@@ -78,44 +86,34 @@ try:
             f.write(f"NLTK data downloaded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         NLTK_AVAILABLE = True
-    
-    NLTK_AVAILABLE = True
 except ImportError:
     print("NLTK库未安装，将使用基本文本处理")
     NLTK_AVAILABLE = False
+    _nltk_ngrams = None
 
-def extract_github_link(text, paper_url=None, title=None, authors=None, pdf_url=None):
+def extract_github_link(text: str):
     """从文本中提取GitHub链接
 
     Args:
         text: 论文摘要文本
-        paper_url: 论文URL
-        title: 论文标题
-        authors: 作者列表
-        pdf_url: PDF文件URL
 
     Returns:
         str: GitHub链接或None
     """
-    # GitHub链接模式
+    # GitHub链接模式（从具体到宽松排列）
     github_patterns = [
-        # GitHub链接
-        r'https?://github\.com/[a-zA-Z0-9-]+/[a-zA-Z0-9-_.]+',
-        r'github\.com/[a-zA-Z0-9-]+/[a-zA-Z0-9-_.]+',
-        r'https?://www\.github\.com/[a-zA-Z0-9-]+/[a-zA-Z0-9-_.]+',
-        r'www\.github\.com/[a-zA-Z0-9-]+/[a-zA-Z0-9-_.]+',
-        # 项目页面
+        # 带协议或 www 前缀的仓库链接
+        r'https?://(?:www\.)?github\.com/[a-zA-Z0-9-]+/[a-zA-Z0-9-_.]+',
+        # 无协议的仓库链接
+        r'(?:www\.)?github\.com/[a-zA-Z0-9-]+/[a-zA-Z0-9-_.]+',
+        # 项目主页
         r'https?://[a-zA-Z0-9-]+\.github\.io/[a-zA-Z0-9-_.]+',
-        # 通用代码链接模式
-        r'code.*available.*?(?:https?://github\.com/[^\s<>"]+)',
-        r'implementation.*?(?:https?://github\.com/[^\s<>"]+)',
-        r'source.*code.*?(?:https?://github\.com/[^\s<>"]+)',
     ]
 
-    # 从摘要中查找
+    # 从摘要中查找，返回第一个匹配
     for pattern in github_patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
-        for match in matches:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
             url = match.group(0)
             if not url.startswith('http'):
                 url = 'https://' + url
@@ -124,30 +122,34 @@ def extract_github_link(text, paper_url=None, title=None, authors=None, pdf_url=
     return None
 
 
-def extract_arxiv_id(url):
-    """从ArXiv URL中提取论文ID
+def summarize_contribution(core_contribution, max_items: int = 2, max_len: int = 50):
+    """精简核心贡献内容：去除模板化表述、限制条数并截断长度
 
     Args:
-        url: ArXiv论文URL
+        core_contribution: 核心贡献字符串（多条以 | 分隔）
+        max_items: 最多保留的条数
+        max_len: 每条的最大长度，None 表示不截断
 
     Returns:
-        str: 论文ID
+        List[str]: 精简后的贡献列表
     """
-    # 处理不同格式的ArXiv URL
-    patterns = [
-        r"arxiv\.org/abs/(\d+\.\d+)",
-        r"arxiv\.org/pdf/(\d+\.\d+)",
-    ]
+    if not core_contribution:
+        return []
+    if "|" in core_contribution:
+        items = [item.strip() for item in core_contribution.split("|")]
+    else:
+        items = [core_contribution.strip()]
+    # 去除模板化内容
+    blacklist = ["代码开源", "提供数据集", "代码已开源", "数据集已公开"]
+    items = [i for i in items if all(b not in i for b in blacklist)]
+    # 限制条数并截断
+    items = items[:max_items]
+    if max_len:
+        items = [(i[:max_len] + ("..." if len(i) > max_len else "")) for i in items]
+    return items
 
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
 
-    return None
-
-
-def df_to_markdown_table(papers_by_category: dict, target_date) -> str:
+def df_to_markdown_table(papers_by_category: dict) -> str:
     """生成表格形式的Markdown内容，支持两级类别标题"""
     markdown = ""
     
@@ -180,27 +182,11 @@ def df_to_markdown_table(papers_by_category: dict, target_date) -> str:
             markdown += "|" + "|".join(headers) + "|\n"
             markdown += "|" + "|".join(["---"] * len(headers)) + "|\n"
             for paper in papers:
-                if paper['is_updated']:
-                    status = f"📝 更新"
-                else:
-                    status = f"🆕 发布"
-                def summarize_contribution(core_contribution):
-                    if not core_contribution:
-                        return []
-                    if "|" in core_contribution:
-                        items = [item.strip() for item in core_contribution.split("|")]
-                    else:
-                        items = [core_contribution.strip()]
-                    blacklist = ["代码开源", "提供数据集", "代码已开源", "数据集已公开"]
-                    items = [i for i in items if all(b not in i for b in blacklist)]
-                    items = items[:2]
-                    items = [(i[:50] + ("..." if len(i) > 50 else "")) for i in items]
-                    return items
-                contrib_list = []
-                if "核心贡献" in paper:
-                    contrib_list = summarize_contribution(paper["核心贡献"])
-                if paper['github_url'] != 'None':
-                    code_and_contribution = f"[代码]({paper['github_url']})"
+                status = "📝 更新" if paper['is_updated'] else "🆕 发布"
+                contrib_list = summarize_contribution(paper.get("核心贡献", ""), max_items=2)
+                github_url = paper.get('github_url')
+                if github_url:
+                    code_and_contribution = f"[代码]({github_url})"
                     if contrib_list:
                         code_and_contribution += "; " + "; ".join(contrib_list)
                 elif contrib_list:
@@ -278,37 +264,14 @@ def df_to_markdown_detailed(papers_by_category: dict, target_date) -> str:
                 # 合并代码链接和精简后的核心贡献
                 markdown += '**Code/Contribution:**\n'
                 
-                # 精简核心贡献内容
-                def summarize_contribution(core_contribution):
-                    if not core_contribution:
-                        return []
-                    # 分割为多条
-                    if "|" in core_contribution:
-                        items = [item.strip() for item in core_contribution.split("|")] 
-                    else:
-                        items = [core_contribution.strip()]
-                    # 去除模板化内容
-                    blacklist = ["代码开源", "提供数据集", "代码已开源", "数据集已公开"]
-                    items = [i for i in items if all(b not in i for b in blacklist)]
-                    # 只保留前三条
-                    items = items[:3]
-                    return items
+                # 精简核心贡献内容（最多保留三条，不截断）
+                contrib_list = summarize_contribution(paper.get("核心贡献", ""), max_items=3, max_len=None)
                 
-                # 处理核心贡献
-                contrib_list = []
-                if "核心问题" in paper:
-                    markdown += f'问题：{paper["核心问题"]}\n'
-                
-                if "核心方法" in paper:
-                    markdown += f'方法：{paper["核心方法"]}\n'
-                
-                if "核心贡献" in paper:
-                    contrib_list = summarize_contribution(paper["核心贡献"])
-                    if contrib_list:
-                        markdown += f'{", ".join(contrib_list)}\n'
+                if contrib_list:
+                    markdown += f'{", ".join(contrib_list)}\n'
                 
                 # 处理代码链接
-                if paper['github_url'] != 'None':
+                if paper.get('github_url'):
                     markdown += f'[代码]({paper["github_url"]})\n'
                 
                 # 添加空行
@@ -317,6 +280,7 @@ def df_to_markdown_detailed(papers_by_category: dict, target_date) -> str:
     return markdown
 
 
+@lru_cache(maxsize=8192)
 def preprocess_text(text: str) -> str:
     """
     对文本进行预处理，包括小写转换、分词、去停用词、词干提取和词形还原
@@ -632,13 +596,11 @@ def get_category_by_keywords(title: str, abstract: str, categories_config: Dict)
     
     # 检查是否有应用类别的特征
     application_category = "领域特定视觉应用 (Domain-specific Visual Applications)"
-    has_application_features = False
     application_score = 0
     application_subcategory = None
     
     # 如果应用类别有足够的得分，则认为有应用特征 - 调整阈值为0.35，平衡准确性和覆盖率
     if application_category in scores and scores[application_category] >= 0.35:
-        has_application_features = True
         application_score = scores[application_category]
         # 尝试获取应用类别的子类别
         application_subcategory = get_subcategory(title, abstract, application_category, application_score)
@@ -731,7 +693,17 @@ def get_category_by_keywords(title: str, abstract: str, categories_config: Dict)
         if len(sorted_candidates) == 1:
             return [sorted_candidates[0]]
         
-        # 如果有多个候选类别，使用ChatGLM做出决策
+        # 关闭LLM仲裁时直接取得分最高的类别
+        if not ENABLE_LLM_ARBITRATION:
+            return [sorted_candidates[0]]
+        
+        # 仅当前两名得分接近时才调用LLM仲裁，节省API调用
+        top_score = sorted_candidates[0][1]
+        second_score = sorted_candidates[1][1]
+        if top_score > 0 and (top_score - second_score) / top_score >= 0.3:
+            return [sorted_candidates[0]]
+        
+        # 前两名得分接近，使用ChatGLM做出决策
         try:
             from chatglm_helper import ChatGLMHelper
             chatglm_helper = ChatGLMHelper()
@@ -773,94 +745,8 @@ def get_category_by_keywords(title: str, abstract: str, categories_config: Dict)
             
             return [(top_category, top_score, subcategory, explanation)]
     
-    # 如果有候选类别，使用ChatGLM做出最终决策
-    if candidate_categories:
-        # 按得分降序排序候选类别
-        sorted_candidates = sorted(candidate_categories, key=lambda x: x[1], reverse=True)
-        
-        # 如果只有一个候选类别，直接返回
-        if len(sorted_candidates) == 1:
-            return [sorted_candidates[0]]
-        
-        # 如果有多个候选类别，使用ChatGLM做出决策
-        try:
-            from chatglm_helper import ChatGLMHelper
-            chatglm_helper = ChatGLMHelper()
-            
-            # 使用ChatGLM决策最终类别
-            final_category = chatglm_helper.decide_category(title, abstract, sorted_candidates)
-            
-            # 找到对应的候选类别元组
-            for candidate in sorted_candidates:
-                if candidate[0] == final_category:
-                    return [candidate]
-            
-            # 如果找不到对应的候选类别，返回得分最高的
-            return [sorted_candidates[0]]
-        except Exception as e:
-            print(f"ChatGLM决策分类出错: {str(e)}")
-            # 如果出错，返回得分最高的候选类别
-            return [sorted_candidates[0]]
-        
     # 如果所有尝试都失败，返回空列表
     return []
-
-
-def calculate_category_relation(category1, category2, categories_config):
-    """
-    计算两个类别之间的相关性
-    
-    Args:
-        category1: 第一个类别名称
-        category2: 第二个类别名称
-        categories_config: 类别配置字典
-        
-    Returns:
-        float: 相关性分数 (0-1)，越高表示越相关
-    """
-    # 如果类别相同，相关性为1
-    if category1 == category2:
-        return 1.0
-    
-    # 获取两个类别的关键词
-    keywords1 = set()
-    keywords2 = set()
-    
-    if category1 in categories_config and "keywords" in categories_config[category1]:
-        keywords1 = {kw[0].lower() for kw in categories_config[category1]["keywords"] if isinstance(kw, tuple)}
-    
-    if category2 in categories_config and "keywords" in categories_config[category2]:
-        keywords2 = {kw[0].lower() for kw in categories_config[category2]["keywords"] if isinstance(kw, tuple)}
-    
-    # 如果任一类别没有关键词，返回0
-    if not keywords1 or not keywords2:
-        return 0.0
-    
-    # 计算关键词重叠
-    overlap = keywords1.intersection(keywords2)
-    
-    # 使用Jaccard相似度计算相关性
-    similarity = len(overlap) / len(keywords1.union(keywords2))
-    
-    # 预定义的相关类别对
-    related_pairs = [
-        ("视觉表征与基础模型", "自监督与表征学习"),
-        ("视觉识别与理解", "三维视觉与几何推理"),
-        ("生成式视觉模型", "视觉-语言协同理解"),
-        ("时序视觉分析", "具身智能与交互视觉"),
-        ("计算效率与模型优化", "鲁棒性与可靠性"),
-        ("低资源与高效学习", "计算效率与模型优化")
-    ]
-    
-    # 检查是否为预定义的相关类别对
-    for pair in related_pairs:
-        if (category1.startswith(pair[0]) and category2.startswith(pair[1])) or \
-           (category1.startswith(pair[1]) and category2.startswith(pair[0])):
-            # 增加相关性分数
-            similarity += 0.2
-            break
-    
-    return min(similarity, 1.0)  # 确保不超过1
 
 
 def get_subcategory(title: str, abstract: str, main_category: str, main_score: float) -> Optional[Tuple[str, float]]:
@@ -888,24 +774,25 @@ def get_subcategory(title: str, abstract: str, main_category: str, main_score: f
     
     # 创建N-gram版本的文本用于短语匹配
     # 这有助于捕获多词短语，即使它们的顺序或形式略有不同
-    from nltk.util import ngrams
-    import re
     
     # 清理并标准化文本用于N-gram处理
     clean_title = re.sub(r'[^\w\s]', ' ', title_lower)
     clean_abstract = re.sub(r'[^\w\s]', ' ', abstract_lower)
     
-    # 生成2-gram和3-gram
     title_words = clean_title.split()
     abstract_words = clean_abstract.split()
     
-    # 生成2-gram
-    title_bigrams = [' '.join(ng) for ng in ngrams(title_words, 2)] if len(title_words) >= 2 else []
-    abstract_bigrams = [' '.join(ng) for ng in ngrams(abstract_words, 2)] if len(abstract_words) >= 2 else []
-    
-    # 生成3-gram
-    title_trigrams = [' '.join(ng) for ng in ngrams(title_words, 3)] if len(title_words) >= 3 else []
-    abstract_trigrams = [' '.join(ng) for ng in ngrams(abstract_words, 3)] if len(abstract_words) >= 3 else []
+    # 生成2-gram和3-gram（NLTK 不可用时降级为不生成）
+    if NLTK_AVAILABLE and _nltk_ngrams is not None:
+        title_bigrams = [' '.join(ng) for ng in _nltk_ngrams(title_words, 2)] if len(title_words) >= 2 else []
+        abstract_bigrams = [' '.join(ng) for ng in _nltk_ngrams(abstract_words, 2)] if len(abstract_words) >= 2 else []
+        title_trigrams = [' '.join(ng) for ng in _nltk_ngrams(title_words, 3)] if len(title_words) >= 3 else []
+        abstract_trigrams = [' '.join(ng) for ng in _nltk_ngrams(abstract_words, 3)] if len(abstract_words) >= 3 else []
+    else:
+        title_bigrams = []
+        abstract_bigrams = []
+        title_trigrams = []
+        abstract_trigrams = []
     
     # 合并所有N-gram
     all_ngrams = set(title_bigrams + abstract_bigrams + title_trigrams + abstract_trigrams)
@@ -982,70 +869,14 @@ def get_subcategory(title: str, abstract: str, main_category: str, main_score: f
     return None
 
 
-def calculate_category_relation(category1, category2, categories_config):
-    """
-    计算两个类别之间的相关性
-    
-    Args:
-        category1: 第一个类别名称
-        category2: 第二个类别名称
-        categories_config: 类别配置字典
-        
-    Returns:
-        float: 相关性分数 (0-1)，越高表示越相关
-    """
-    # 如果类别相同，相关性为1
-    if category1 == category2:
-        return 1.0
-    
-    # 获取两个类别的关键词
-    keywords1 = set()
-    keywords2 = set()
-    
-    if category1 in categories_config and "keywords" in categories_config[category1]:
-        keywords1 = {kw[0].lower() for kw in categories_config[category1]["keywords"] if isinstance(kw, tuple)}
-    
-    if category2 in categories_config and "keywords" in categories_config[category2]:
-        keywords2 = {kw[0].lower() for kw in categories_config[category2]["keywords"] if isinstance(kw, tuple)}
-    
-    # 如果任一类别没有关键词，返回0
-    if not keywords1 or not keywords2:
-        return 0.0
-    
-    # 计算关键词重叠
-    overlap = keywords1.intersection(keywords2)
-    
-    # 使用Jaccard相似度计算相关性
-    similarity = len(overlap) / len(keywords1.union(keywords2))
-    
-    # 预定义的相关类别对
-    related_pairs = [
-        ("视觉表征与基础模型", "自监督与表征学习"),
-        ("视觉识别与理解", "三维视觉与几何推理"),
-        ("生成式视觉模型", "视觉-语言协同理解"),
-        ("时序视觉分析", "具身智能与交互视觉"),
-        ("计算效率与模型优化", "鲁棒性与可靠性"),
-        ("低资源与高效学习", "计算效率与模型优化")
-    ]
-    
-    # 检查是否为预定义的相关类别对
-    for pair in related_pairs:
-        if (category1.startswith(pair[0]) and category2.startswith(pair[1])) or \
-           (category1.startswith(pair[1]) and category2.startswith(pair[0])):
-            # 增加相关性分数
-            similarity += 0.2
-            break
-    
-    return min(similarity, 1.0)  # 确保不超过1
-
-
-def process_paper(paper, glm_helper, target_date):
+def process_paper(paper, glm_helper, target_date, llm_executor=None):
     """处理单篇论文的所有分析任务
 
     Args:
         paper: ArXiv论文对象
         glm_helper: ChatGLM助手实例
         target_date: 目标日期
+        llm_executor: 共享的LLM任务线程池（可选，用于并发执行翻译和分析）
 
     Returns:
         Dict: 包含论文信息的字典，如果论文不符合日期要求则返回None
@@ -1057,7 +888,7 @@ def process_paper(paper, glm_helper, target_date):
         paper_url = paper.entry_id
         author_list = paper.authors
         authors = [author.name for author in author_list]
-        authors_str = ', '.join(authors[:8]) + (' .etc.' if len(authors) > 8 else '')  # 限制作者显示数量，超过8个显示etc.
+        authors_str = ', '.join(authors[:MAX_AUTHORS_SHOWN]) + (' .etc.' if len(authors) > MAX_AUTHORS_SHOWN else '')
         published = paper.published
         updated = paper.updated
 
@@ -1072,26 +903,33 @@ def process_paper(paper, glm_helper, target_date):
             (link.href for link in paper.links if link.title == "pdf"), None)
         
         # 初始化默认值，避免异常时未定义
-        github_link = "None"
-        category = "其他 (Others)"  # 修改默认值为带英文的格式
+        github_link = extract_github_link(abstract)
+        category = "其他 (Others)"
         subcategory = "未指定"
         title_cn = f"[翻译失败] {title}"
         analysis = {}
 
-        # 并行执行耗时任务
+        # 执行耗时任务（标题翻译 + 贡献分析），使用共享线程池控制并发
+        # 受 config.py 中 ENABLE_TITLE_TRANSLATION / ENABLE_CONTRIBUTION_ANALYSIS 控制
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                # 提交所有任务
-                github_future = executor.submit(extract_github_link, abstract)
-                analysis_future = executor.submit(
-                    glm_helper.analyze_paper_contribution, title, abstract)
-                title_cn_future = executor.submit(
-                    glm_helper.translate_title, title)
-
-                # 等待所有任务完成
-                github_link = github_future.result() or "None"
-                analysis = analysis_future.result() or {}
-                title_cn = title_cn_future.result() or f"[翻译失败] {title}"
+            if ENABLE_CONTRIBUTION_ANALYSIS and ENABLE_TITLE_TRANSLATION:
+                if llm_executor is not None:
+                    analysis_future = llm_executor.submit(
+                        glm_helper.analyze_paper_contribution, title, abstract)
+                    title_cn_future = llm_executor.submit(
+                        glm_helper.translate_title, title)
+                    analysis = analysis_future.result() or {}
+                    title_cn = title_cn_future.result() or f"[翻译失败] {title}"
+                else:
+                    analysis = glm_helper.analyze_paper_contribution(title, abstract) or {}
+                    title_cn = glm_helper.translate_title(title) or f"[翻译失败] {title}"
+            else:
+                if ENABLE_CONTRIBUTION_ANALYSIS:
+                    analysis = glm_helper.analyze_paper_contribution(title, abstract) or {}
+                if ENABLE_TITLE_TRANSLATION:
+                    title_cn = glm_helper.translate_title(title) or f"[翻译失败] {title}"
+                else:
+                    title_cn = title  # 关闭翻译时使用英文标题
         except Exception as e:
             print(f"并行处理任务时出错: {str(e)}")
             # 继续处理，使用默认值
@@ -1108,14 +946,12 @@ def process_paper(paper, glm_helper, target_date):
                 
                 # 兼容多种返回格式：(category, score) 或 (category, score, subcategory) 或 (category, score, subcategory, explanation)
                 if len(result_item) >= 4:  # 新格式，包含解释
-                    main_category, main_score, sub_category_tuple, explanation = result_item
+                    main_category, _, sub_category_tuple, _ = result_item
                 elif len(result_item) == 3:  # 旧格式，包含子类别
-                    main_category, main_score, sub_category_tuple = result_item
-                    explanation = None
+                    main_category, _, sub_category_tuple = result_item
                 else:  # 最简单的格式
-                    main_category, main_score = result_item
+                    main_category, _ = result_item
                     sub_category_tuple = None
-                    explanation = None
                     
                 category = main_category
                 
@@ -1174,24 +1010,26 @@ def get_cv_papers():
         target_date = (datetime.now() - timedelta(days=QUERY_DAYS_AGO)).date()
         print(f"\n📅 目标日期: {target_date}")
         print(f"📊 最大论文数: {MAX_RESULTS}")
-        print(f"🧵 最大线程数: {MAX_WORKERS}\n")
+        print(f"🧵 论文处理线程数: {MAX_WORKERS}")
+        print(f"🤖 LLM任务线程数: {LLM_MAX_WORKERS}")
+        print(f"🌐 标题翻译: {'开' if ENABLE_TITLE_TRANSLATION else '关'} | 贡献分析: {'开' if ENABLE_CONTRIBUTION_ANALYSIS else '关'} | LLM仲裁: {'开' if ENABLE_LLM_ARBITRATION else '关'}\n")
 
         # 初始化ChatGLM助手
         print("🤖 初始化ChatGLM助手...")
         glm_helper = ChatGLMHelper()
 
-        # 初始化arxiv客户端
+        # 初始化arxiv客户端（参数来自 config.py）
         print("🔄 初始化arXiv客户端...")
         client = arxiv.Client(
-            page_size=100,  # 每页获取100篇论文
-            delay_seconds=0.5,  # 请求间隔3秒
-            num_retries=5    # 失败重试5次
+            page_size=ARXIV_PAGE_SIZE,
+            delay_seconds=ARXIV_DELAY_SECONDS,
+            num_retries=ARXIV_NUM_RETRIES
         )
         client.query_url_format = ARXIV_API_URL_FORMAT
 
         # 构建查询
         search = arxiv.Search(
-            query='cat:cs.CV',  # 计算机视觉类别
+            query=ARXIV_QUERY,
             max_results=MAX_RESULTS,
             sort_by=arxiv.SortCriterion.LastUpdatedDate,
             sort_order=arxiv.SortOrder.Descending  # 确保按时间降序排序
@@ -1204,15 +1042,16 @@ def get_cv_papers():
         # 确保"其他 (Others)"类别总是存在
         papers_by_category["其他 (Others)"]  # 初始化空列表
 
-        # 使用线程池并行处理论文
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 外层线程池处理论文，内层共享线程池执行LLM任务，
+        # 避免每篇论文反复创建线程池，同时控制API并发
+        with ThreadPoolExecutor(max_workers=LLM_MAX_WORKERS) as llm_executor, \
+             ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             # 创建进度条
             print("\n🔍 开始获取论文...")
             try:
                 results = client.results(search)
             except Exception as e:
-                print(f"⚠️ arXiv 首次请求失败，尝试使用 HTTPS 端点重试: {e}")
-                client.query_url_format = ARXIV_API_URL_FORMAT
+                print(f"⚠️ arXiv 首次请求失败，直接重试: {e}")
                 results = client.results(search)
             
             # 创建总进度条
@@ -1234,9 +1073,8 @@ def get_cv_papers():
             )
             
             # 批量处理论文
-            batch_size = 10  # 每批处理10篇论文
+            batch_size = ARXIV_BATCH_SIZE
             papers = []
-            futures = []
             
             for i, paper in enumerate(results):
                 papers.append(paper)
@@ -1248,7 +1086,7 @@ def get_cv_papers():
                     
                     # 提交所有任务
                     batch_futures = [
-                        executor.submit(process_paper, paper, glm_helper, target_date)
+                        executor.submit(process_paper, paper, glm_helper, target_date, llm_executor)
                         for paper in papers
                     ]
                     
@@ -1275,13 +1113,13 @@ def get_cv_papers():
                 batch_pbar.total = len(papers)  # 设置正确的总数
                 
                 # 提交所有任务
-                futures = [
-                    executor.submit(process_paper, paper, glm_helper, target_date)
+                batch_futures = [
+                    executor.submit(process_paper, paper, glm_helper, target_date, llm_executor)
                     for paper in papers
                 ]
                 
                 # 等待所有任务完成
-                for future in as_completed(futures):
+                for future in as_completed(batch_futures):
                     paper_info = future.result()
                     if paper_info:  # 如果论文符合日期要求
                         total_papers += 1
@@ -1396,13 +1234,12 @@ def save_papers_to_markdown(papers_by_category: dict, target_date):
     filename = target_date.strftime("%Y-%m-%d") + ".md"
     year_month = target_date.strftime("%Y-%m")
 
-    # 获取当前文件所在目录(scripts)的父级路径
+    # 获取当前文件所在目录(scripts)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    parent_dir = os.path.dirname(current_dir)
 
-    # 设置基础目录，与scripts同级
-    data_base = os.path.join(parent_dir, 'data')
-    local_base = os.path.join(parent_dir, 'local')
+    # 输出目录来自 config.py（相对于 scripts/ 目录）
+    data_base = os.path.normpath(os.path.join(current_dir, DATA_DIR))
+    local_base = os.path.normpath(os.path.join(current_dir, LOCAL_DIR))
 
     # 创建年月子目录
     data_year_month = os.path.join(data_base, year_month)
@@ -1410,7 +1247,8 @@ def save_papers_to_markdown(papers_by_category: dict, target_date):
 
     # 创建所需的目录结构
     os.makedirs(data_year_month, exist_ok=True)
-    os.makedirs(local_year_month, exist_ok=True)
+    if ENABLE_DETAILED_OUTPUT:
+        os.makedirs(local_year_month, exist_ok=True)
 
     # 生成完整的文件路径
     table_filepath = os.path.join(data_year_month, filename)
@@ -1423,98 +1261,18 @@ def save_papers_to_markdown(papers_by_category: dict, target_date):
     with open(table_filepath, 'w', encoding='utf-8') as f:
         f.write(title)
         # f.write("\n## 论文列表\n\n")
-        f.write(df_to_markdown_table(papers_by_category, target_date))
+        f.write(df_to_markdown_table(papers_by_category))
 
-    # 保存详细格式的markdown文件到local/年-月目录
-    with open(detailed_filepath, 'w', encoding='utf-8') as f:
-        f.write(title)
-        # f.write("\n## 论文详情\n\n")
-        f.write(df_to_markdown_detailed(papers_by_category, target_date))
+    # 保存详细格式的markdown文件到local/年-月目录（受 ENABLE_DETAILED_OUTPUT 控制）
+    if ENABLE_DETAILED_OUTPUT:
+        with open(detailed_filepath, 'w', encoding='utf-8') as f:
+            f.write(title)
+            # f.write("\n## 论文详情\n\n")
+            f.write(df_to_markdown_detailed(papers_by_category, target_date))
 
     print(f"\n表格格式文件已保存到: {table_filepath}")
-    print(f"详细格式文件已保存到: {detailed_filepath}")
-
-
-def generate_statistics_markdown(papers_by_category: dict) -> str:
-    """生成统计信息的Markdown格式文本
-    
-    Args:
-        papers_by_category: 按类别组织的论文字典
-        
-    Returns:
-        str: Markdown格式的统计信息
-    """
-    markdown = "## 统计信息\n\n"
-    
-    # 计算总论文数
-    total_papers = sum(len(papers) for papers in papers_by_category.values())
-    markdown += f"**总论文数**: {total_papers} 篇\n\n"
-    
-    # 按论文数量降序排序类别
-    sorted_categories = sorted(
-        papers_by_category.items(),
-        key=lambda x: len(x[1]),
-        reverse=True
-    )
-    
-    # 一级分类统计
-    markdown += "### 一级分类统计\n\n"
-    markdown += "| 类别 | 论文数 | 新发布 | 更新 |\n"
-    markdown += "|------|--------|--------|------|\n"
-    
-    for category, papers in sorted_categories:
-        num_new = sum(1 for p in papers if not p['is_updated'])
-        num_updated = sum(1 for p in papers if p['is_updated'])
-        markdown += f"| {category} | {len(papers)} | {num_new} | {num_updated} |\n"
-    
-    # 二级分类统计
-    markdown += "\n### 二级分类统计\n\n"
-    
-    for category, papers in sorted_categories:
-        if len(papers) == 0:
-            continue
-            
-        markdown += f"#### {category}\n\n"
-        markdown += "| 子类别 | 论文数 | 新发布 | 更新 |\n"
-        markdown += "|--------|--------|--------|------|\n"
-        
-        # 如果是"其他 (Others)"类别，直接处理所有论文
-        # 对于其他类别，将没有子类别的论文移动到"其他 (Others)"类别中
-        papers_with_subcategory = []
-        
-        if category != "其他 (Others)":
-            # 分离有子类别的论文和无子类别的论文
-            for paper in papers:
-                subcategory = paper.get('subcategory', '')
-                if subcategory and subcategory != "未指定":
-                    papers_with_subcategory.append(paper)
-                # 没有子类别的论文已经被移动到"其他 (Others)"类别中
-        else:
-            # 对于"其他 (Others)"类别，所有论文都直接处理
-            papers_with_subcategory = papers
-        
-        # 按子类别分组有子类别的论文
-        papers_by_subcategory = defaultdict(list)
-        for paper in papers_with_subcategory:
-            subcategory = paper.get('subcategory', '')
-            papers_by_subcategory[subcategory].append(paper)
-        
-        # 按论文数量降序排序子类别
-        sorted_subcategories = sorted(
-            papers_by_subcategory.items(),
-            key=lambda x: len(x[1]),
-            reverse=True
-        )
-        
-        # 添加子类别统计
-        for subcategory, subpapers in sorted_subcategories:
-            num_new = sum(1 for p in subpapers if not p['is_updated'])
-            num_updated = sum(1 for p in subpapers if p['is_updated'])
-            markdown += f"| {subcategory} | {len(subpapers)} | {num_new} | {num_updated} |\n"
-        
-        markdown += "\n"
-    
-    return markdown
+    if ENABLE_DETAILED_OUTPUT:
+        print(f"详细格式文件已保存到: {detailed_filepath}")
 
 
 if __name__ == "__main__":

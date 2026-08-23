@@ -5,7 +5,7 @@ An automated system for fetching, analyzing, and organizing the latest computer 
 ## Features
 
 - **Automated Paper Retrieval**: Automatically fetches the latest CV papers from ArXiv
-- **AI-Powered Analysis**: Uses ChatGLM for intelligent paper categorization and analysis
+- **AI-Powered Analysis**: Uses Doubao / ChatGLM for intelligent paper categorization and analysis
 - **Bilingual Support**: Provides paper titles in both English and Chinese
 - **Code Link Detection**: Automatically extracts GitHub repository links
 - **Organized Output**: Generates well-structured Markdown reports
@@ -15,24 +15,29 @@ An automated system for fetching, analyzing, and organizing the latest computer 
 ## Project Structure
 
 ```
-CascadeProjects/
-├── scripts/           # Script files
-│   ├── get_cv_papers.py     # Main program
-│   ├── chatglm_helper.py    # ChatGLM API helper
-│   └── requirements.txt     # Dependencies
-├── data/              # Table-format paper information
+ArXiv_CV_Papers_Daily/
+├── scripts/                 # 脚本目录
+│   ├── get_cv_papers.py     # 主程序：抓取、分类、生成 Markdown
+│   ├── chatglm_helper.py    # LLM 助手：翻译、贡献分析、分类仲裁
+│   ├── chatglm_client.py    # ChatGLM 客户端封装
+│   ├── doubao_client.py     # 豆包客户端封装
+│   ├── categories_config.py # 分类体系与关键词配置
+│   ├── config.py            # 非敏感配置（可提交 Git）
+│   ├── .env.example         # 密钥模板（复制为 .env）
+│   └── requirements.txt     # 依赖
+├── data/                    # 表格格式论文信息
 │   └── YYYY-MM/
 │       └── YYYY-MM-DD.md
-└── local/             # Detailed paper information
+└── local/                   # 详细格式论文信息（本地，不提交 Git）
     └── YYYY-MM/
         └── YYYY-MM-DD.md
 ```
 
 ## Requirements
 
-- Python 3.x
+- Python 3.8+
 - Dependencies listed in `requirements.txt`
-- ChatGLM API key
+- Doubao 或 ChatGLM API key（配置在 `scripts/.env`）
 - Stable internet connection
 
 ## Installation
@@ -42,14 +47,30 @@ CascadeProjects/
 ```bash
 pip install -r requirements.txt
 ```
-3. Configure ChatGLM API key
+3. Configure API keys via `scripts/.env`（见下方 Configuration）
 
 ## Configuration
 
-Key parameters in `get_cv_papers.py`:
+非敏感配置集中在 `config.py`（可安全提交到 Git），所有参数均会生效：
+
+- `LLM_PROVIDER` / `DOUBAO_MODEL` / `DOUBAO_BASE_URL` / `CHATGLM_MODEL` / `CHATGLM_BASE_URL` / `CHATGLM_ENABLE_THINKING`：LLM 提供商与模型
+- `LLM_TIMEOUT` / `LLM_MAX_RETRIES` / `LLM_RETRY_DELAY` / `LLM_MAX_WORKERS`：LLM 请求通用参数
+- `TRANSLATE_*` / `ANALYZE_*` / `DECIDE_*`：各任务生成参数（temperature / max_tokens / top_p / 重试次数）
+- `ENABLE_TITLE_TRANSLATION` / `ENABLE_CONTRIBUTION_ANALYSIS` / `ENABLE_LLM_ARBITRATION` / `ENABLE_DETAILED_OUTPUT`：功能开关
 - `QUERY_DAYS_AGO`: Days to look back (0=today, 1=yesterday)
-- `MAX_RESULTS`: Maximum number of papers to retrieve
-- `MAX_WORKERS`: Maximum parallel processing threads
+- `MAX_RESULTS` / `MAX_WORKERS` / `MAX_AUTHORS_SHOWN`：论文数量、并发线程数、作者展示上限
+- `ARXIV_QUERY` / `ARXIV_PAGE_SIZE` / `ARXIV_DELAY_SECONDS` / `ARXIV_NUM_RETRIES` / `ARXIV_BATCH_SIZE`：ArXiv 客户端参数
+- `DATA_DIR` / `LOCAL_DIR`：输出目录（相对于 scripts/）
+
+敏感配置（API Key）放在 `scripts/.env` 中（已被 .gitignore 忽略，不会提交）：
+
+1. 复制模板：`cp scripts/.env.example scripts/.env`
+2. 填入真实密钥：
+```bash
+DOUBAO_API_KEY=your_doubao_api_key_here
+CHATGLM_API_KEY=your_chatglm_api_key_here
+```
+同名环境变量优先级高于 `.env` 文件。
 
 ## Usage
 
@@ -75,16 +96,22 @@ The script generates two types of Markdown files:
 
 ## Research Categories
 
-Current supported research areas:
-1. 3DGS (3D Gaussian Splatting)
-2. NeRF (Neural Radiance Fields)
-3. 3D Vision and Reconstruction
-4. Image Generation and Editing
-5. Multimodal Learning
-6. Object Detection and Segmentation
-7. Video Understanding and Processing
-8. Human Pose and Action
-9. Others
+分类体系定义在 `categories_config.py`，共 13 个一级类别（中英文对照）：
+
+1. 视觉表征与基础模型 (Visual Representation & Foundation Models)
+2. 视觉识别与理解 (Visual Recognition & Understanding)
+3. 生成式视觉模型 (Generative Visual Modeling)
+4. 三维视觉与几何推理 (3D Vision & Geometric Reasoning)
+5. 时序视觉分析 (Temporal Visual Analysis)
+6. 自监督与表征学习 (Self-supervised & Representation Learning)
+7. 计算效率与模型优化 (Computational Efficiency & Model Optimization)
+8. 鲁棒性与可靠性 (Robustness & Reliability)
+9. 低资源与高效学习 (Low-resource & Efficient Learning)
+10. 具身智能与交互视觉 (Embodied Intelligence & Interactive Vision)
+11. 视觉-语言协同理解 (Vision-Language Joint Understanding)
+12. 领域特定视觉应用 (Domain-specific Visual Applications)
+13. 新兴理论与跨学科方向 (Emerging Theory & Interdisciplinary Directions)
+14. 其他 (Others)
 
 ## Automated Deployment
 
@@ -94,7 +121,7 @@ Set up daily automatic runs using crontab:
 crontab -e
 
 # Add this line to run at 9 AM daily
-0 9 * * * cd /path/to/CascadeProjects/scripts && python get_cv_papers.py
+0 9 * * * cd /path/to/ArXiv_CV_Papers_Daily/scripts && python get_cv_papers.py
 ```
 
 ## Error Handling
@@ -107,141 +134,15 @@ The script includes:
 
 ## Security Notes
 
-- Store API keys securely
-- Monitor API usage
-- Keep dependencies updated
+- API Key 存放在 `scripts/.env`（已被 .gitignore 忽略），或通过同名环境变量注入
+- 定期轮换 API Key，监控 API 使用量
 - Use virtual environments
 
 ## Future Improvements
 
-- Enhanced error recovery
-- More research categories
-- Better code link detection
+- 更好代码链接检测
 - Interactive web interface
-- Multi-language support
 - Advanced paper filtering
-
----
-
-# ArXiv CV 论文每日更新
-
-这是一个自动获取、分析和整理 ArXiv 计算机视觉（CV）领域最新论文的系统，具有 AI 驱动的分类功能。
-
-## 功能特点
-
-- **自动论文获取**：自动从 ArXiv 获取最新 CV 论文
-- **AI 驱动分析**：使用 ChatGLM 进行智能论文分类和分析
-- **双语支持**：提供中英文论文标题
-- **代码链接检测**：自动提取 GitHub 仓库链接
-- **结构化输出**：生成结构良好的 Markdown 报告
-- **并行处理**：使用多线程提高效率
-- **智能分类**：将论文分类到特定研究领域
-
-## 项目结构
-
-```
-CascadeProjects/
-├── scripts/           # 脚本文件
-│   ├── get_cv_papers.py     # 主程序
-│   ├── chatglm_helper.py    # ChatGLM API 助手
-│   └── requirements.txt     # 依赖项
-├── data/              # 表格格式论文信息
-│   └── YYYY-MM/
-│       └── YYYY-MM-DD.md
-└── local/             # 详细格式论文信息
-    └── YYYY-MM/
-        └── YYYY-MM-DD.md
-```
-
-## 系统要求
-
-- Python 3.x
-- requirements.txt 中列出的依赖项
-- ChatGLM API 密钥
-- 稳定的网络连接
-
-## 安装方法
-
-1. 克隆仓库
-2. 安装依赖：
-```bash
-pip install -r requirements.txt
-```
-3. 配置 ChatGLM API 密钥
-
-## 配置说明
-
-主要参数（在 get_cv_papers.py 中）：
-- `QUERY_DAYS_AGO`：查询几天前的论文（0=今天，1=昨天）
-- `MAX_RESULTS`：最大返回论文数量
-- `MAX_WORKERS`：并行处理的最大线程数
-
-## 使用方法
-
-运行主脚本：
-```bash
-python get_cv_papers.py
-```
-
-### 输出文件
-
-脚本生成两种格式的 Markdown 文件：
-
-1. 表格格式（data/YYYY-MM/YYYY-MM-DD.md）：
-   - 基本论文信息
-   - 按研究方向分类
-   - 简洁的表格形式
-
-2. 详细格式（local/YYYY-MM/YYYY-MM-DD.md）：
-   - 完整论文详情
-   - AI 生成的分析
-   - 核心贡献
-   - 代码链接
-
-## 研究类别
-
-当前支持的研究方向：
-1. 3DGS (3D 高斯散射)
-2. NeRF (神经辐射场)
-3. 3D 视觉与重建
-4. 图像生成与编辑
-5. 多模态学习
-6. 目标检测与分割
-7. 视频理解与处理
-8. 人体姿态与动作
-9. 其他
-
-## 自动化部署
-
-使用 crontab 设置每日自动运行：
-```bash
-# 编辑 crontab
-crontab -e
-
-# 添加以下行（每天早上9点运行）
-0 9 * * * cd /path/to/CascadeProjects/scripts && python get_cv_papers.py
-```
-
-## 错误处理
-
-脚本包含以下错误处理机制：
-- ArXiv API 速率限制处理
-- 网络错误恢复
-- 并行处理错误处理
-- 文件系统错误处理
-
-## 安全注意事项
-
-- 安全存储 API 密钥
-- 监控 API 使用情况
-- 保持依赖项更新
-- 使用虚拟环境
-
-## 未来改进
-
-- 增强错误恢复能力
-- 增加研究类别
-- 改进代码链接检测
 - 交互式网页界面
 - 多语言支持
 - 高级论文筛选

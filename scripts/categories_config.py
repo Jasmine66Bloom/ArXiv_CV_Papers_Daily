@@ -267,7 +267,7 @@ CATEGORY_PROMPT = """
    定义：研究视觉与语言协同理解的方法，如视觉问答、图像描述和多模态对话等。
 
 # 12. 领域特定视觉应用
-"领域特定视觉应用 (Domain-specific Visual Applications)"：医学影像分析、智能交通视觉、工业视觉检测、遠感与地理信息、创意媒体生成、增强/虚拟现实、生物特征识别
+"领域特定视觉应用 (Domain-specific Visual Applications)"：医学影像分析、智能交通视觉、工业视觉检测、遥感与地理信息、创意媒体生成、增强/虚拟现实、生物特征识别
    定义：研究视觉技术在特定领域的应用，如医学影像、智能交通和工业视觉等。
 
 # 13. 新兴理论与跨学科方向
@@ -618,8 +618,8 @@ CATEGORY_KEYWORDS = {
             ("defect detection", 2.0),                # 缺陷检测
             ("quality control", 1.8),                 # 质量控制
             
-            # 遠感与地理信息（高权重）
-            ("remote sensing", 2.0),                  # 遠感
+            # 遥感与地理信息（高权重）
+            ("remote sensing", 2.0),                  # 遥感
             ("geospatial information", 2.0),          # 地理信息
             ("satellite imagery", 1.8),               # 卫星图像
         ],

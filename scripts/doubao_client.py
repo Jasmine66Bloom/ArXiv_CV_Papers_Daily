@@ -1,9 +1,13 @@
 """豆包大模型 API 客户端封装（支持多种模型，包括 DeepSeek）"""
-import requests
-import json
 import time
-from typing import Optional, List, Dict, Any
+
+import requests
+
+from typing import Optional, List, Dict
 from dataclasses import dataclass
+
+# 复用连接池，避免每次请求都重新建立TCP连接
+_SESSION = requests.Session()
 
 
 @dataclass
@@ -87,14 +91,19 @@ class DoubaoCompletions:
     
     def create(
         self,
-        model: str,
         messages: List[Dict[str, str]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 1000,
         top_p: float = 0.9,
         **kwargs
     ) -> DoubaoResponse:
-        """创建对话完成请求（兼容 chat/completions 接口）"""
+        """创建对话完成请求（兼容 chat/completions 接口）
+
+        Args:
+            messages: 对话消息列表
+            model: 模型名称，默认使用客户端配置的模型
+        """
         normalized_messages = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -105,7 +114,7 @@ class DoubaoCompletions:
                 normalized_messages.append({"role": role, "content": str(content)})
         
         payload = {
-            "model": self.client.model,
+            "model": model or self.client.model,
             "messages": normalized_messages,
             "temperature": temperature,
             "top_p": top_p,
@@ -122,14 +131,13 @@ class DoubaoCompletions:
         max_retries = kwargs.get("max_retries", 3)
         retry_delay = kwargs.get("retry_delay", 2)
         
-        last_exception = None
         for attempt in range(max_retries):
             try:
-                response = requests.post(
+                response = _SESSION.post(
                     f"{self.client.base_url}/api/v3/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=60
+                    timeout=kwargs.get("timeout", 60)
                 )
                 
                 if response.status_code != 200:
@@ -138,12 +146,11 @@ class DoubaoCompletions:
                 response_data = response.json()
                 return DoubaoResponse.from_api_response(response_data)
             except Exception as e:
-                last_exception = e
                 if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
+                    # 指数退避，避免瞬时网络抖动导致长时间阻塞
+                    time.sleep(min(retry_delay * (2 ** attempt), 30))
                     continue
-                else:
-                    raise e
+                raise
 
 
 class DoubaoChat:
@@ -161,7 +168,7 @@ class DoubaoClient:
     使用示例:
         client = DoubaoClient(api_key="your-api-key")
         response = client.chat.completions.create(
-            model="doubao-seed-1-6-flash-250828",  # 会被忽略，使用配置的模型
+            model="doubao-seed-1-6-flash-250828",  # 可覆盖客户端配置的模型
             messages=[{"role": "user", "content": "你好"}],
             temperature=0.7,
             max_tokens=100

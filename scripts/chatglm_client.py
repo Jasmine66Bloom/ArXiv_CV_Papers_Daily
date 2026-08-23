@@ -1,6 +1,13 @@
 """ChatGLM 大模型 API 客户端封装（支持 glm-4.7 的 thinking 参数）"""
-from typing import Optional, List, Dict, Any
+import time
+
+import requests
+
+from typing import Optional, List, Dict
 from dataclasses import dataclass
+
+# 复用连接池，避免每次请求都重新建立TCP连接
+_SESSION = requests.Session()
 
 
 @dataclass
@@ -52,9 +59,6 @@ class ChatGLMCompletions:
         **kwargs
     ) -> ChatGLMResponse:
         """创建对话完成请求（兼容 chat/completions 接口）"""
-        import requests
-        import time
-        
         normalized_messages = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -86,14 +90,13 @@ class ChatGLMCompletions:
         max_retries = kwargs.get("max_retries", 3)
         retry_delay = kwargs.get("retry_delay", 2)
         
-        last_exception = None
         for attempt in range(max_retries):
             try:
-                response = requests.post(
+                response = _SESSION.post(
                     f"{self.client.base_url}/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=60
+                    timeout=kwargs.get("timeout", 60)
                 )
                 
                 if response.status_code != 200:
@@ -102,12 +105,11 @@ class ChatGLMCompletions:
                 response_data = response.json()
                 return ChatGLMResponse.from_api_response(response_data)
             except Exception as e:
-                last_exception = e
                 if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
+                    # 指数退避，避免瞬时网络抖动导致长时间阻塞
+                    time.sleep(min(retry_delay * (2 ** attempt), 30))
                     continue
-                else:
-                    raise e
+                raise
 
 
 class ChatGLMChat:
